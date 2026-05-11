@@ -1,4 +1,4 @@
-use suckfish::chess::{Board, Move};
+use suckfish::chess::{Board, Move, MoveList};
 use suckfish::nnue_runtime::NnueRuntime;
 use suckfish::search::{search_best_move, SearchReport};
 use suckfish::time_manager::{TimeBudget, TimeManager};
@@ -6,6 +6,7 @@ use suckfish::tt::TranspositionTable;
 
 use anyhow::Result;
 use clap::Parser;
+use std::env;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -106,13 +107,12 @@ fn main() -> Result<()> {
                                     maximum: remaining_max
                                         .max(Duration::from_millis(1)),
                                 };
-                                let refined = search_best_move(
+                                let refined = run_parallel_search(
                                     &mut board,
                                     &mut tt,
                                     32,
                                     Some(refined_budget),
-                                    nnue_runner.as_ref(),
-                                    None,
+                                    &nnue_runner,
                                     history.as_slice(),
                                 );
                                 if refined.depth >= ponder_sr.depth {
@@ -124,8 +124,9 @@ fn main() -> Result<()> {
                                 ponder_sr
                             };
                             eprintln!(
-                                "{:?}, nps: {}",
-                                final_report,
+                                "depth: {}, nodes: {}, nps: {}",
+                                final_report.depth,
+                                final_report.stats.nodes,
                                 final_report.nps()
                             );
                             if let Some(bm) = final_report.best_move {
@@ -144,16 +145,20 @@ fn main() -> Result<()> {
                     }
                 }
 
-                let sr = search_best_move(
+                let sr = run_parallel_search(
                     &mut board,
                     &mut tt,
                     32,
                     Some(think_time),
-                    nnue_runner.as_ref(),
-                    None,
+                    &nnue_runner,
                     history.as_slice(),
                 );
-                eprintln!("{:?}, nps: {}", sr, sr.nps());
+                eprintln!(
+                    "depth: {}, nodes: {}, nps: {}",
+                    sr.depth,
+                    sr.stats.nodes,
+                    sr.nps()
+                );
                 if let Some(bm) = sr.best_move {
                     println!("{}", bm.to_uci());
                     ponder = start_ponder(
@@ -237,6 +242,7 @@ fn start_ponder(
         nnue.as_ref(),
         None,
         &ponder_history,
+        None,
     );
     let reply = reply_report.best_move?;
     if !board_after.play_move(reply) {
@@ -265,6 +271,7 @@ fn start_ponder(
             nnue_clone.as_ref(),
             Some(stop_clone),
             &ponder_history,
+            None,
         );
         let _ = tx.send(report);
     });
@@ -312,4 +319,119 @@ impl GameHistory {
     fn as_slice(&self) -> &[u64] {
         &self.positions
     }
+}
+
+fn search_thread_count() -> usize {
+    let env_threads = env::var("SUCKFISH_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    env_threads.unwrap_or_else(|| {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
+}
+
+fn run_parallel_search(
+    board: &mut Board,
+    tt: &mut TranspositionTable,
+    max_depth: u8,
+    time_budget: Option<TimeBudget>,
+    nnue_runner: &Arc<NnueRuntime>,
+    history: &[u64],
+) -> SearchReport {
+    let root_hints: Vec<Move> = {
+        let mut list = MoveList::new();
+        board.legal_moves_into(&mut list);
+        list.iter().copied().collect()
+    };
+    let hint_for = |index: usize| -> Option<Move> {
+        if root_hints.is_empty() {
+            None
+        } else {
+            Some(root_hints[index % root_hints.len()])
+        }
+    };
+
+    let threads = search_thread_count();
+    if threads <= 1 {
+        return search_best_move(
+            board,
+            tt,
+            max_depth,
+            time_budget.clone(),
+            nnue_runner.as_ref(),
+            None,
+            history,
+            hint_for(0),
+        );
+    }
+
+    let worker_count = threads.saturating_sub(1);
+    if worker_count == 0 {
+        return search_best_move(
+            board,
+            tt,
+            max_depth,
+            time_budget.clone(),
+            nnue_runner.as_ref(),
+            None,
+            history,
+            hint_for(0),
+        );
+    }
+
+    let mut best_report = search_best_move(
+        board,
+        tt,
+        max_depth,
+        time_budget.clone(),
+        nnue_runner.as_ref(),
+        None,
+        history,
+        hint_for(0),
+    );
+    let mut combined_nodes = best_report.stats.nodes;
+
+    let (tx, rx) = mpsc::channel();
+    let history_snapshot: Vec<u64> = history.to_vec();
+    for worker_idx in 0..worker_count {
+        let mut worker_board = board.clone();
+        let mut worker_tt = TranspositionTable::new(16);
+        let nnue_clone = nnue_runner.clone();
+        let budget_clone = time_budget.clone();
+        let history_clone = history_snapshot.clone();
+        let tx_clone = tx.clone();
+        let hint = hint_for(worker_idx + 1);
+        thread::spawn(move || {
+            let report = search_best_move(
+                &mut worker_board,
+                &mut worker_tt,
+                max_depth,
+                budget_clone,
+                nnue_clone.as_ref(),
+                None,
+                &history_clone,
+                hint,
+            );
+            let _ = tx_clone.send(report);
+        });
+    }
+    drop(tx);
+
+    for _ in 0..worker_count {
+        if let Ok(report) = rx.recv() {
+            combined_nodes += report.stats.nodes;
+            if report.depth > best_report.depth
+                || (report.depth == best_report.depth
+                    && report.stats.nodes > best_report.stats.nodes)
+            {
+                best_report = report;
+            }
+        }
+    }
+    best_report.stats.nodes = combined_nodes;
+
+    best_report
 }

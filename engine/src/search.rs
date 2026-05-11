@@ -12,6 +12,31 @@ const MATE_VALUE: i32 = 30_000;
 const ENDGAME_MATERIAL_THRESHOLD: i32 = 2_000;
 const MAX_PLY: usize = 64;
 const SEE_RANGE: i32 = 100;
+const MATE_SCORE_BUFFER: i32 = MAX_PLY as i32;
+
+fn mated_score_from_ply(ply: usize) -> i32 {
+    -MATE_VALUE + ply as i32
+}
+
+fn to_tt_score(score: i32, ply: usize) -> i32 {
+    if score >= MATE_VALUE - MATE_SCORE_BUFFER {
+        score + ply as i32
+    } else if score <= -MATE_VALUE + MATE_SCORE_BUFFER {
+        score - ply as i32
+    } else {
+        score
+    }
+}
+
+fn from_tt_score(score: i32, ply: usize) -> i32 {
+    if score >= MATE_VALUE - MATE_SCORE_BUFFER {
+        score - ply as i32
+    } else if score <= -MATE_VALUE + MATE_SCORE_BUFFER {
+        score + ply as i32
+    } else {
+        score
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SearchStatistics {
@@ -229,6 +254,7 @@ pub fn search_best_move(
     nnue_runner: &NnueRuntime,
     abort_flag: Option<Arc<AtomicBool>>,
     repetition_history: &[u64],
+    root_hint: Option<Move>,
 ) -> SearchReport {
     let mut stats = SearchStatistics::default();
     let mut root_moves = MoveList::new();
@@ -252,7 +278,7 @@ pub fn search_best_move(
         board.material_count(),
     );
 
-    let mut best_move = None;
+    let mut best_move = root_hint;
     let mut completed_depth = 0;
     let mut last_score = 0;
     const ASP_WINDOW: i32 = 100;
@@ -403,13 +429,14 @@ fn negamax(
     if let Some(entry) = ctx.tt.probe(key) {
         tt_move = entry.best_move;
         if entry.depth >= depth {
+            let value = from_tt_score(entry.value, ply);
             match entry.bound {
-                Bound::Exact => return entry.value,
-                Bound::Lower => window.alpha = window.alpha.max(entry.value),
-                Bound::Upper => window.beta = window.beta.min(entry.value),
+                Bound::Exact => return value,
+                Bound::Lower => window.alpha = window.alpha.max(value),
+                Bound::Upper => window.beta = window.beta.min(value),
             }
             if window.alpha >= window.beta {
-                return entry.value;
+                return value;
             }
         }
     }
@@ -443,7 +470,7 @@ fn negamax(
     order_moves(ctx.board, &mut moves, None, tt_move, killers, ctx.state);
     if moves.is_empty() {
         if ctx.board.is_in_check(ctx.board.active_color) {
-            return -MATE_VALUE + depth as i32;
+            return mated_score_from_ply(ply);
         } else {
             return 0;
         }
@@ -524,7 +551,9 @@ fn negamax(
     } else {
         Bound::Exact
     };
-    ctx.tt.store(key, depth, best_value, bound, best_move);
+    let store_value = to_tt_score(best_value, ply);
+    ctx.tt
+        .store(key, depth, store_value, bound, best_move);
     best_value
 }
 

@@ -61,9 +61,15 @@ async def get_move(request: Request):
             return JSONResponse(content={m: None, "move_probs": None, "error": "Failed to get move", "message": "Move probabilities is not a dictionary"}, status_code=500)
 
     # Translate move_probs to Dict[str, float]
-    move_probs_dict = {move.uci(): prob for move, prob in move_probs.items()}
+    def format_move(m: chess.Move) -> str:
+        uci = m.uci()
+        if len(uci) == 5:
+            return f"{uci[2:4]}={uci[4].upper()}"
+        return uci
 
-    return JSONResponse(content={"move": move.uci(), "error": None, "time_taken": time_taken, "move_probs": move_probs_dict, "logs": logs})
+    move_probs_dict = {format_move(move): prob for move, prob in move_probs.items()}
+
+    return JSONResponse(content={"move": format_move(move), "error": None, "time_taken": time_taken, "move_probs": move_probs_dict, "logs": logs})
 
 if __name__ == "__main__":
     port = int(os.getenv("SERVE_PORT", "5058"))

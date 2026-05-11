@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import requests
 import zipfile
+import threading
 
 def run_with_out(cmd, **kwargs):
     p = subprocess.Popen(
@@ -67,6 +68,8 @@ old_path = os.environ.get("PATH", "")
 env["PATH"] = f"{LIBTORCH}/bin" + (f":{old_path}" if old_path else "")
 old_ld = os.environ.get("LD_LIBRARY_PATH", "")
 env["LD_LIBRARY_PATH"] = f"{LIBTORCH}/lib" + (f":{old_ld}" if old_ld else "")
+old_dyld = os.environ.get("DYLD_LIBRARY_PATH", "")
+env["DYLD_LIBRARY_PATH"] = f"{LIBTORCH}/lib" + (f":{old_dyld}" if old_dyld else "")
 
 print("Libtorch set.")
 
@@ -74,15 +77,22 @@ engine = subprocess.Popen(
     [os.path.join(os.getcwd(), 'suckfish')],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
-    stderr=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
     text=True,
     bufsize=1,
     env=env,
 )
-# for line in engine.stderr:
-#     if not line:
-#         break
-#     print(line, end='', flush=True)
+
+
+def _log_engine_stderr(stream):
+    for line in iter(stream.readline, ''):
+        if not line:
+            break
+        print(f"[engine] {line.rstrip()}", flush=True)
+    stream.close()
+
+
+threading.Thread(target=_log_engine_stderr, args=(engine.stderr,), daemon=True).start()
 print('============== Done setup ==============')
 
 @chess_manager.entrypoint
@@ -91,6 +101,7 @@ def test_func(ctx: GameContext):
     engine.stdin.write(f'go {ctx.timeLeft} {fen}\n')
     engine.stdin.flush()
     uci = engine.stdout.readline().strip()
+    print(f"time remaining: {ctx.timeLeft} ms", flush=True)
     print(uci)
     move = Move.from_uci(uci)
     return move
