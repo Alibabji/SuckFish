@@ -1045,6 +1045,10 @@ impl Board {
         None
     }
 
+    pub fn piece_count(&self) -> u32 {
+        self.occupancy.count_ones()
+    }
+
     fn remove_piece_internal(&mut self, square: Square) -> Option<Piece> {
         let mask = square_bitboard(square);
         for color_idx in 0..2 {

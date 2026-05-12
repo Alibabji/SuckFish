@@ -1,5 +1,6 @@
 use crate::chess::{piece_value, Board, Move, MoveList, PieceKind};
 use crate::nnue_runtime::NnueRuntime;
+use crate::tablebase;
 use crate::time_manager::TimeBudget;
 use crate::tt::{Bound, TranspositionTable};
 use std::sync::{
@@ -256,6 +257,7 @@ pub fn search_best_move(
     repetition_history: &[u64],
     root_hint: Option<Move>,
 ) -> SearchReport {
+    let start = Instant::now();
     let mut stats = SearchStatistics::default();
     let mut root_moves = MoveList::new();
     board.legal_moves_into(&mut root_moves);
@@ -268,7 +270,15 @@ pub fn search_best_move(
         };
     }
 
-    let start = Instant::now();
+    if let Some(best_move) = tablebase::best_root_move(board) {
+        return SearchReport {
+            best_move: Some(best_move),
+            depth: 0,
+            stats,
+            elapsed: start.elapsed(),
+        };
+    }
+
     let deadlines = time_budget.map(|b| (start + b.optimal, start + b.maximum));
     let mut state = SearchState::new(
         deadlines,
@@ -420,6 +430,9 @@ fn negamax(
     if ctx.state.is_threefold(ctx.board.hash()) {
         return 0;
     }
+    if let Some(score) = tablebase::probe_score(ctx.board, ply) {
+        return score;
+    }
 
     let alpha_orig = window.alpha;
     let beta_orig = window.beta;
@@ -552,8 +565,7 @@ fn negamax(
         Bound::Exact
     };
     let store_value = to_tt_score(best_value, ply);
-    ctx.tt
-        .store(key, depth, store_value, bound, best_move);
+    ctx.tt.store(key, depth, store_value, bound, best_move);
     best_value
 }
 
@@ -564,6 +576,9 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
     ctx.stats.record_node();
     if ctx.state.is_threefold(ctx.board.hash()) {
         return 0;
+    }
+    if let Some(score) = tablebase::probe_score(ctx.board, ply) {
+        return score;
     }
 
     let stand_pat = ctx.nnue_runner.eval(ctx.board).unwrap_or(-MATE_VALUE);
