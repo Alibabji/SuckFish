@@ -74,9 +74,9 @@ fn main() -> Result<()> {
                 } else {
                     time_slice
                 };
-                let fen = fen_slice;
+                let (fen, history_fens) = parse_position_payload(fen_slice);
                 let mut board = Board::from_fen(fen)?;
-                history.reset(&board);
+                history.reset_from_fens(&history_fens, &board);
                 let position_hash = board.hash();
 
                 let time_ms = time_left.trim().parse::<u64>().unwrap_or(0);
@@ -307,9 +307,16 @@ impl GameHistory {
         }
     }
 
-    fn reset(&mut self, board: &Board) {
+    fn reset_from_fens(&mut self, fens: &[&str], current: &Board) {
         self.positions.clear();
-        append_history(&mut self.positions, board);
+        for fen in fens {
+            if let Ok(board) = Board::from_fen(fen) {
+                append_history(&mut self.positions, &board);
+            }
+        }
+        if self.positions.last().copied() != Some(current.hash()) {
+            append_history(&mut self.positions, current);
+        }
     }
 
     fn clear(&mut self) {
@@ -318,6 +325,20 @@ impl GameHistory {
 
     fn as_slice(&self) -> &[u64] {
         &self.positions
+    }
+}
+
+fn parse_position_payload(payload: &str) -> (&str, Vec<&str>) {
+    const HISTORY_DELIMITER: &str = " |history| ";
+    if let Some((fen, history)) = payload.split_once(HISTORY_DELIMITER) {
+        let history_fens = history
+            .split(" |fen| ")
+            .map(str::trim)
+            .filter(|fen| !fen.is_empty())
+            .collect();
+        (fen.trim(), history_fens)
+    } else {
+        (payload.trim(), Vec::new())
     }
 }
 

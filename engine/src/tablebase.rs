@@ -130,7 +130,8 @@ pub fn best_root_move(board: &mut Board) -> Option<Move> {
 
     for &mv in moves.as_slice() {
         let undo = board.make_move(mv);
-        let score = probe_score(board, 1).map(|score| -score);
+        let score = probe_score(board, 1)
+            .map(|score| -score + root_progress_bonus(board, mv));
         board.unmake_move(undo);
 
         if let Some(score) = score {
@@ -142,4 +143,32 @@ pub fn best_root_move(board: &mut Board) -> Option<Move> {
     }
 
     best_move
+}
+
+fn root_progress_bonus(board_after: &mut Board, mv: Move) -> i32 {
+    let mut replies = MoveList::new();
+    board_after.legal_moves_into(&mut replies);
+
+    if replies.is_empty() {
+        return if board_after.is_in_check(board_after.active_color) {
+            900
+        } else {
+            -10_000
+        };
+    }
+
+    let mut bonus = 0;
+    if mv.is_promotion() {
+        bonus += 160;
+    }
+    if board_after.halfmove_clock == 0 {
+        bonus += 120;
+    }
+    if board_after.is_in_check(board_after.active_color) {
+        bonus += 80;
+    }
+
+    bonus += (64 - replies.len() as i32).clamp(0, 64);
+    bonus += (100 - board_after.halfmove_clock.min(100) as i32) / 3;
+    bonus
 }

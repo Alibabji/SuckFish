@@ -270,6 +270,15 @@ pub fn search_best_move(
         };
     }
 
+    if let Some(mate_move) = immediate_mate_move(board, &root_moves) {
+        return SearchReport {
+            best_move: Some(mate_move),
+            depth: 0,
+            stats,
+            elapsed: start.elapsed(),
+        };
+    }
+
     if let Some(best_move) = tablebase::best_root_move(board) {
         return SearchReport {
             best_move: Some(best_move),
@@ -430,6 +439,9 @@ fn negamax(
     if ctx.state.is_threefold(ctx.board.hash()) {
         return 0;
     }
+    if ctx.board.halfmove_clock >= 100 {
+        return 0;
+    }
     if let Some(score) = tablebase::probe_score(ctx.board, ply) {
         return score;
     }
@@ -577,11 +589,14 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
     if ctx.state.is_threefold(ctx.board.hash()) {
         return 0;
     }
+    if ctx.board.halfmove_clock >= 100 {
+        return 0;
+    }
     if let Some(score) = tablebase::probe_score(ctx.board, ply) {
         return score;
     }
 
-    let stand_pat = ctx.nnue_runner.eval(ctx.board).unwrap_or(-MATE_VALUE);
+    let stand_pat = evaluate(ctx);
     if stand_pat >= window.beta {
         return stand_pat;
     }
@@ -621,6 +636,97 @@ fn quiescence(ctx: &mut SearchContext, mut window: SearchWindow, ply: usize) -> 
     }
 
     window.alpha
+}
+
+fn immediate_mate_move(board: &mut Board, root_moves: &MoveList) -> Option<Move> {
+    for &mv in root_moves.as_slice() {
+        let undo = board.make_move(mv);
+        let mut replies = MoveList::new();
+        board.legal_moves_into(&mut replies);
+        let is_mate = replies.is_empty() && board.is_in_check(board.active_color);
+        board.unmake_move(undo);
+        if is_mate {
+            return Some(mv);
+        }
+    }
+
+    None
+}
+
+fn evaluate(ctx: &SearchContext) -> i32 {
+    ctx.nnue_runner.eval(ctx.board).unwrap_or(-MATE_VALUE) + mop_up_score(ctx.board)
+}
+
+fn color_index(color: crate::chess::Color) -> usize {
+    match color {
+        crate::chess::Color::White => 0,
+        crate::chess::Color::Black => 1,
+    }
+}
+
+fn opponent_color(color: crate::chess::Color) -> crate::chess::Color {
+    match color {
+        crate::chess::Color::White => crate::chess::Color::Black,
+        crate::chess::Color::Black => crate::chess::Color::White,
+    }
+}
+
+fn king_distance(a: crate::chess::Square, b: crate::chess::Square) -> i32 {
+    let rank_distance = (a.rank() as i32 - b.rank() as i32).abs();
+    let file_distance = (a.file() as i32 - b.file() as i32).abs();
+    rank_distance.max(file_distance)
+}
+
+fn edge_distance_bonus(square: crate::chess::Square) -> i32 {
+    let rank = square.rank() as i32;
+    let file = square.file() as i32;
+    let rank_edge = rank.min(7 - rank);
+    let file_edge = file.min(7 - file);
+    3 - rank_edge.min(file_edge)
+}
+
+fn mop_up_score(board: &Board) -> i32 {
+    let mut material = [0; 2];
+    let mut kings = [None, None];
+
+    for idx in 0..64 {
+        let square = crate::chess::Square::from_index(idx);
+        if let Some(piece) = board.piece_at(square) {
+            let color_idx = color_index(piece.color);
+            if piece.kind == PieceKind::King {
+                kings[color_idx] = Some(square);
+            } else {
+                material[color_idx] += piece_value(piece.kind);
+            }
+        }
+    }
+
+    let side = board.active_color;
+    let opponent = opponent_color(side);
+    let side_idx = color_index(side);
+    let opponent_idx = color_index(opponent);
+    let side_advantage = material[side_idx] - material[opponent_idx];
+
+    let (winning_idx, losing_idx, sign) = if side_advantage >= 500 {
+        (side_idx, opponent_idx, 1)
+    } else if side_advantage <= -500 {
+        (opponent_idx, side_idx, -1)
+    } else {
+        return 0;
+    };
+
+    let Some(winning_king) = kings[winning_idx] else {
+        return 0;
+    };
+    let Some(losing_king) = kings[losing_idx] else {
+        return 0;
+    };
+
+    let edge_bonus = edge_distance_bonus(losing_king) * 28;
+    let king_closeness = (7 - king_distance(winning_king, losing_king)) * 12;
+    let progress_bonus = (100 - board.halfmove_clock.min(100) as i32) / 4;
+
+    sign * (edge_bonus + king_closeness + progress_bonus)
 }
 
 fn order_moves(
